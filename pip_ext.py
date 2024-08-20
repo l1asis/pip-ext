@@ -1,16 +1,15 @@
 import argparse
 import configparser
-import html
-import html.parser
 import pathlib
 import re
 import tomllib
-from html.entities import name2codepoint
 from html.parser import HTMLParser
-from subprocess import call
+from packaging.requirements import Requirement
 from urllib.parse import urlparse
 
-import pkg_resources
+import importlib.resources
+import importlib.metadata
+import importlib.abc
 import requests
 
 
@@ -36,12 +35,12 @@ class Regex:
     GITHUB_VERSION_TAG = r"<a.*?href=\".*?/releases/tag/.*?>(?P<tag>.*?{version}.*?)</a>" 
     DEPENDENCIES = re.compile(r"(?:(?:install_requires|requires)\s*?=\s*?\[(?P<deps>(\s*.*?)+)\])")
     STRING = re.compile(r"[\"'](.*?)[\"']")
-    DID_YOU_MEAN = re.compile(r"Did you mean '(?P<name>.*?)'\?")
+    DID_YOU_MEAN = re.compile(r"Did you mean '.*?>(?P<name>.*?)<.*?'\?")
 
 class PyPIPackageHTMLParser(HTMLParser):
     def __init__(self, *, convert_charrefs: bool = True) -> None:
         super().__init__(convert_charrefs=convert_charrefs)
-        self.capture = ""
+        self.capture = None
         self.package = {}
 
     def handle_starttag(self, tag, attrs):
@@ -98,6 +97,39 @@ class PyPIPackageHTMLParser(HTMLParser):
                 if self.lastdata == "Project links":
                     self.package["Links"] = []
 
+class SnykAdvisorHTMLParser(HTMLParser):
+    def __init__(self, *, convert_charrefs: bool = True) -> None:
+        super().__init__(convert_charrefs=convert_charrefs)
+        self.lastdata = self.capture = None
+        self.spans = ("Package Health Score", "Popularity", "GitHub Stars", "Forks",
+                      "Maintenance", "Open Issues", "Open PR", "Last Release",
+                      "Last Commit", "Security", "License", "Security Policy", 
+                      "Community", "Readme", "Contributing.md", "Code of Conduct",
+                      "Contributors", "Funding", "Python Versions Compatibility",
+                      "Age", "Latest Release", "Dependencies", "Versions",
+                      "Maintainers", "Wheels")
+        self.progress = {title: False for title in self.spans}
+        self.package_health = {}
+    
+    def handle_starttag(self, tag, attrs):
+        ...
+
+    def handle_endtag(self, tag):
+        ...
+
+    def handle_data(self, data):
+        data = data.strip()
+        if not self.capture:
+            if data in self.spans and not self.progress[data]:
+                self.capture = data
+                self.progress[data] = True
+            elif data == "(Latest)":
+                self.package_health["Latest Version"] = self.lastdata
+        else:
+            if data:
+                self.package_health[self.capture.title()] = data
+                self.capture = None
+        self.lastdata = data
 
 def is_valid_package_name(name: str) -> bool:
     if re.match(r"[a-zA-Z](?:[a-zA-Z0-9]+|(?:\-|\.[a-zA-Z0-9]+))*", name):
@@ -109,6 +141,14 @@ def confirm(message: str = "", question = "Are you sure?") -> bool:
     if answer.strip() in ("y", "Y"):
         return True
     return False
+
+def did_you_mean(session: requests.Session, query: str) -> str:
+    response = session.get(url="https://pypi.org/search/", params={"q": query}, headers=HEADERS)
+    content = response.content.decode("utf-8")
+    if (match_ := re.search(Regex.DID_YOU_MEAN, content)):
+        if confirm(question=f"Did you mean {repr(match_["name"])}?"):
+            return match_["name"]
+    return query
 
 def search_dependencies(session: requests.Session, package: dict[str, str], version: str):
     source = source_url = None
@@ -146,7 +186,7 @@ def search_dependencies(session: requests.Session, package: dict[str, str], vers
         source_raw_url = f"https://raw.githubusercontent.com{source.path}/{tag if tag else branch}"
         dependencies, optional_dependencies = set(), set()
 
-        response = requests.get(f"{source_raw_url}/setup.cfg", headers=HEADERS)
+        response = session.get(f"{source_raw_url}/setup.cfg", headers=HEADERS)
         if response.status_code != 404:
             content = response.content.decode("utf-8")
             config = configparser.ConfigParser()
@@ -186,12 +226,7 @@ def search(args) -> None:
 
     session = requests.Session()
 
-    response = session.get(url="https://pypi.org/search/", params={"q": query}, headers=HEADERS)
-    content = response.content.decode("utf-8")
-
-    if (match_ := re.search(Regex.DID_YOU_MEAN, content)):
-        if confirm(question=match_.group()):
-            query = match_["name"]
+    query = did_you_mean(session, query)
     
     response = session.get(url=f"https://pypi.org/project/{query}/{f'{version}/' if version else ''}", headers=HEADERS)
     content = response.content.decode("utf-8")
@@ -216,6 +251,53 @@ def search(args) -> None:
                 string += f"\n{' '*4}{repr(identifier):<10} --> {repr(packages)}"
         print(string)
 
+def careful_install(args):
+    requirement_specifier: str = args.requirement_specifier
+    requirement = Requirement(requirement_specifier)
+    
+    session = requests.Session()
+
+    name = did_you_mean(session, requirement.name)
+    if name != requirement.name:
+        requirement.name = name
+
+    response = session.get(url=f"https://snyk.io/advisor/python/{requirement.name}/", headers=HEADERS)
+    content = response.content.decode("utf-8")
+
+    if content.find("Project Not found") != -1:
+        print(f"No such project named {repr(requirement.name)} was found.")
+    else:
+        html_parser = SnykAdvisorHTMLParser()
+        html_parser.feed(content)
+        print(html_parser.package_health)
+
+def compact_freeze(args):
+    distributions = set(distribution.name for distribution in importlib.metadata.distributions())
+    versions = {distribution.name: distribution.version for distribution in importlib.metadata.distributions()}
+    table = {distribution.name.lower(): distribution.name for distribution in importlib.metadata.distributions()}
+
+    for distribution in importlib.metadata.distributions():
+        if distribution.requires:
+            extras = set()
+            for requirement_string in distribution.requires:
+                requirement = Requirement(requirement_string)
+                if requirement.marker is not None and requirement.marker.evaluate():
+                    extra_match = re.search(r"extra == \"(.*?)\"", str(requirement.marker))
+                    if extra_match:
+                        extra = extra_match.group()
+                        if extra not in extras:
+                            extras.add(extra)
+                if requirement.marker is None or requirement.marker.evaluate():
+                    if requirement.name.lower() in table and table[requirement.name.lower()] in distributions:
+                        distributions.remove(table[requirement.name.lower()])
+            if extras:
+                distributions.remove(distribution.name)
+                distributions.add(f"{distribution.name}[{','.join(extras)}]")
+                
+    distributions = sorted(distributions, key=lambda string: string.lower())
+    if not args.no_version:
+        distributions = (f"{distribution}=={versions[distribution]}" for distribution in distributions)
+    print("\n".join(distributions))
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="pip-ext", description="pip Additional Functionality Program")
@@ -226,11 +308,14 @@ def main() -> None:
     parser_search.add_argument("-v", "--version", type=str)
     parser_search.set_defaults(func=search)
 
-    parser_smart_install = subparsers.add_parser("smart-install")
-    ...
+    parser_careful_install = subparsers.add_parser("careful-install") # or careful-install ?
+    parser_careful_install.add_argument("requirement_specifier", type=str)
+    parser_careful_install.add_argument("--verbose", dest="verbose", action="store_true")
+    parser_careful_install.set_defaults(func=careful_install)
 
-    parser_smart_freeze = subparsers.add_parser("smart-freeze")
-    ...
+    parser_compact_freeze = subparsers.add_parser("compact-freeze") # or compact-freeze ?
+    parser_compact_freeze.add_argument("--no-version", dest="no_version", action="store_true")
+    parser_compact_freeze.set_defaults(func=compact_freeze)
 
     parser_difference = subparsers.add_parser("difference")
     ...
@@ -243,7 +328,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if len(args._get_kwargs()) > 1:
+    if True:
         args.func(args)
     else:
         parser.print_usage()
