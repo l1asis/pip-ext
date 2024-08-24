@@ -288,8 +288,13 @@ def compact_freeze(args):
                         if extra not in extras:
                             extras.add(extra)
                 if requirement.marker is None or requirement.marker.evaluate():
-                    if requirement.name.lower() in table and table[requirement.name.lower()] in distributions:
-                        distributions.remove(table[requirement.name.lower()])
+                    lowered_name = requirement.name.lower()
+                    possible_names = (lowered_name,
+                                      lowered_name.replace("-", "_"),
+                                      lowered_name.replace("_", "-"),)
+                    for name in possible_names:
+                        if name in table and table[name] in distributions:
+                            distributions.remove(table[name])
             if extras:
                 distributions.remove(distribution.name)
                 distributions.add(f"{distribution.name}[{','.join(extras)}]")
